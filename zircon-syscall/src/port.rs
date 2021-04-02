@@ -4,17 +4,16 @@ use {
 };
 
 impl Syscall<'_> {
+    /// Create an IO port.  
     pub fn sys_port_create(&self, options: u32, mut out: UserOutPtr<HandleValue>) -> ZxResult {
         info!("port.create: options={:#x}", options);
-        if options != 0 {
-            unimplemented!()
-        }
-        let port_handle = Handle::new(Port::new(), Rights::DEFAULT_PORT);
+        let port_handle = Handle::new(Port::new(options)?, Rights::DEFAULT_PORT);
         let handle_value = self.thread.proc().add_handle(port_handle);
         out.write(handle_value)?;
         Ok(())
     }
 
+    /// Wait for a packet arrival in a port.  
     pub async fn sys_port_wait(
         &self,
         handle_value: HandleValue,
@@ -32,18 +31,18 @@ impl Syscall<'_> {
         pin_mut!(future);
         let packet = self
             .thread
-            .blocking_run(future, ThreadState::BlockedPort, deadline.into())
+            .blocking_run(future, ThreadState::BlockedPort, deadline.into(), None)
             .await?;
         packet_res.write(packet)?;
         Ok(())
     }
 
+    /// Queue a packet to a port.  
     pub fn sys_port_queue(
         &self,
         handle_value: HandleValue,
         packcet_in: UserInPtr<PortPacket>,
     ) -> ZxResult {
-        // TODO when to return ZX_ERR_SHOULD_WAIT
         let proc = self.thread.proc();
         let port = proc.get_object_with_rights::<Port>(handle_value, Rights::WRITE)?;
         let packet = packcet_in.read()?;
@@ -51,7 +50,7 @@ impl Syscall<'_> {
             "port.queue: handle={:#x}, packet={:?}",
             handle_value, packet
         );
-        port.push(packet);
+        port.push_user(packet)?;
         Ok(())
     }
 }

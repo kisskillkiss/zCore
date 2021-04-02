@@ -2,8 +2,11 @@
 
 extern crate log;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use {std::path::PathBuf, structopt::StructOpt, zircon_loader::*, zircon_object::object::*};
+use structopt::StructOpt;
+use zircon_loader::*;
+use zircon_object::object::*;
 
 #[derive(Debug, StructOpt)]
 #[structopt()]
@@ -29,11 +32,10 @@ async fn main() {
     proc.wait_signal(Signal::USER_SIGNAL_0).await;
 }
 
-fn open_images(path: &PathBuf) -> std::io::Result<Images<Vec<u8>>> {
+fn open_images(path: &Path) -> std::io::Result<Images<Vec<u8>>> {
     Ok(Images {
         userboot: std::fs::read(path.join("userboot-libos.so"))?,
         vdso: std::fs::read(path.join("libzircon-libos.so"))?,
-        decompressor: std::fs::read(path.join("decompress-zstd.so"))?,
         zbi: std::fs::read(path.join("bringup.zbi"))?,
     })
 }
@@ -71,7 +73,10 @@ mod tests {
         kernel_hal_unix::init();
 
         let opt = Opt {
-            prebuilt_path: PathBuf::from("../prebuilt/zircon"),
+            #[cfg(target_arch = "x86_64")]
+            prebuilt_path: PathBuf::from("../prebuilt/zircon/x64"),
+            #[cfg(target_arch = "aarch64")]
+            prebuilt_path: PathBuf::from("../prebuilt/zircon/arm64"),
             cmdline: String::from(""),
         };
         let images = open_images(&opt.prebuilt_path).expect("failed to read file");

@@ -1,6 +1,12 @@
 use {
-    super::exception::*, super::job_policy::*, super::process::Process, crate::object::*,
-    alloc::sync::Arc, alloc::vec::Vec, spin::Mutex,
+    super::exception::*,
+    super::job_policy::*,
+    super::process::Process,
+    crate::object::*,
+    crate::task::Task,
+    alloc::sync::{Arc, Weak},
+    alloc::vec::Vec,
+    spin::Mutex,
 };
 
 /// Control a group of processes
@@ -37,8 +43,8 @@ pub struct Job {
 impl_kobject!(Job
     fn get_child(&self, id: KoID) -> ZxResult<Arc<dyn KernelObject>> {
         let inner = self.inner.lock();
-        if let Some(job) = inner.children.iter().find(|o| o.id() == id) {
-            return Ok(job.clone());
+        if let Some(job) = inner.children.iter().filter_map(|o|o.upgrade()).find(|o| o.id() == id) {
+            return Ok(job);
         }
         if let Some(proc) = inner.processes.iter().find(|o| o.id() == id) {
             return Ok(proc.clone());
@@ -54,16 +60,18 @@ define_count_helper!(Job);
 #[derive(Default)]
 struct JobInner {
     policy: JobPolicy,
-    children: Vec<Arc<Job>>,
+    children: Vec<Weak<Job>>,
     processes: Vec<Arc<Process>>,
-    critical_proc: Option<(KoID, bool)>,
+    // if the job is killed, no more child creation should works
+    killed: bool,
     timer_policy: TimerSlack,
+    self_ref: Weak<Job>,
 }
 
 impl Job {
     /// Create the root job.
     pub fn root() -> Arc<Self> {
-        Arc::new(Job {
+        let job = Arc::new(Job {
             base: KObjectBase::new(),
             _counter: CountHelper::new(),
             parent: None,
@@ -71,13 +79,17 @@ impl Job {
             exceptionate: Exceptionate::new(ExceptionChannelType::Job),
             debug_exceptionate: Exceptionate::new(ExceptionChannelType::JobDebugger),
             inner: Mutex::new(JobInner::default()),
-        })
+        });
+        job.inner.lock().self_ref = Arc::downgrade(&job);
+        job
     }
 
     /// Create a new child job object.
-    pub fn create_child(self: &Arc<Self>, _options: u32) -> ZxResult<Arc<Self>> {
-        // TODO: options
+    pub fn create_child(self: &Arc<Self>) -> ZxResult<Arc<Self>> {
         let mut inner = self.inner.lock();
+        if inner.killed {
+            return Err(ZxError::BAD_STATE);
+        }
         let child = Arc::new(Job {
             base: KObjectBase::new(),
             _counter: CountHelper::new(),
@@ -87,13 +99,29 @@ impl Job {
             debug_exceptionate: Exceptionate::new(ExceptionChannelType::JobDebugger),
             inner: Mutex::new(JobInner::default()),
         });
-        inner.children.push(child.clone());
+        let child_weak = Arc::downgrade(&child);
+        child.inner.lock().self_ref = child_weak.clone();
+        inner.children.push(child_weak);
         Ok(child)
+    }
+
+    fn remove_child(&self, to_remove: &Weak<Job>) {
+        let mut inner = self.inner.lock();
+        inner.children.retain(|child| !to_remove.ptr_eq(child));
+        if inner.killed && inner.processes.is_empty() && inner.children.is_empty() {
+            drop(inner);
+            self.terminate()
+        }
     }
 
     /// Get the policy of the job.
     pub fn policy(&self) -> JobPolicy {
         self.inner.lock().policy.merge(&self.parent_policy)
+    }
+
+    /// Get the parent job.
+    pub fn parent(&self) -> Option<Arc<Self>> {
+        self.parent.clone()
     }
 
     /// Sets one or more security and/or resource policies to an empty job.
@@ -103,12 +131,16 @@ impl Job {
     ///
     /// After this call succeeds any new child process or child job will have
     /// the new effective policy applied to it.
-    pub fn set_policy_basic(&self, options: SetPolicyOptions, policys: &[BasicPolicy]) -> ZxResult {
+    pub fn set_policy_basic(
+        &self,
+        options: SetPolicyOptions,
+        policies: &[BasicPolicy],
+    ) -> ZxResult {
         let mut inner = self.inner.lock();
         if !inner.is_empty() {
             return Err(ZxError::BAD_STATE);
         }
-        for policy in policys {
+        for policy in policies {
             if self.parent_policy.get_action(policy.condition).is_some() {
                 match options {
                     SetPolicyOptions::Absolute => return Err(ZxError::ALREADY_EXISTS),
@@ -121,6 +153,7 @@ impl Job {
         Ok(())
     }
 
+    /// Sets timer slack policy to an empty job.
     pub fn set_policy_timer_slack(&self, policy: TimerSlackPolicy) -> ZxResult {
         let mut inner = self.inner.lock();
         if !inner.is_empty() {
@@ -131,58 +164,38 @@ impl Job {
         Ok(())
     }
 
-    /// Set a process as critical to the job.
-    ///
-    /// When process terminates, job will be terminated as if `task_kill()` was
-    /// called on it. The return code used will be `ZX_TASK_RETCODE_CRITICAL_PROCESS_KILL`.
-    ///
-    /// The job specified must be the parent of process, or an ancestor.
-    ///
-    /// If `retcode_nonzero` is true, then job will only be terminated if process
-    /// has a non-zero return code.
-    pub fn set_critical(&self, proc: &Arc<Process>, retcode_nonzero: bool) -> ZxResult {
+    /// Add a process to the job.
+    pub(super) fn add_process(&self, process: Arc<Process>) -> ZxResult {
         let mut inner = self.inner.lock();
-        if let Some((pid, _)) = inner.critical_proc {
-            if proc.id() == pid {
-                return Err(ZxError::ALREADY_BOUND);
-            }
+        if inner.killed {
+            return Err(ZxError::BAD_STATE);
         }
-        if !inner.processes.iter().any(|p| proc.id() == p.id()) {
-            return Err(ZxError::INVALID_ARGS);
-        }
-        inner.critical_proc = Some((proc.id(), retcode_nonzero));
+        inner.processes.push(process);
         Ok(())
     }
 
-    /// Add a process to the job.
-    pub(super) fn add_process(&self, process: Arc<Process>) {
-        self.inner.lock().processes.push(process);
-    }
-
-    pub(super) fn process_exit(&self, id: KoID, retcode: i64) {
+    /// Remove a process from the job.
+    pub(super) fn remove_process(&self, id: KoID) {
         let mut inner = self.inner.lock();
         inner.processes.retain(|proc| proc.id() != id);
-        if let Some((pid, retcode_nonzero)) = inner.critical_proc {
-            if pid == id && !(retcode_nonzero && retcode == 0) {
-                unimplemented!("kill the job")
-            }
+        if inner.killed && inner.processes.is_empty() && inner.children.is_empty() {
+            drop(inner);
+            self.terminate()
         }
     }
 
+    /// Get information of this job.
     pub fn get_info(&self) -> JobInfo {
         JobInfo::default()
     }
 
+    /// Check whether this job is root job.
     pub fn check_root_job(&self) -> ZxResult {
         if self.parent.is_some() {
             Err(ZxError::ACCESS_DENIED)
         } else {
             Ok(())
         }
-    }
-
-    pub fn get_exceptionate(&self) -> Arc<Exceptionate> {
-        self.exceptionate.clone()
     }
 
     /// Get KoIDs of Processes.
@@ -192,7 +205,71 @@ impl Job {
 
     /// Get KoIDs of children Jobs.
     pub fn children_ids(&self) -> Vec<KoID> {
-        self.inner.lock().children.iter().map(|j| j.id()).collect()
+        self.inner
+            .lock()
+            .children
+            .iter()
+            .filter_map(|j| j.upgrade())
+            .map(|j| j.id())
+            .collect()
+    }
+
+    /// Return true if this job has no processes and no child jobs.
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
+
+    /// The job finally terminates.
+    fn terminate(&self) {
+        self.exceptionate.shutdown();
+        self.debug_exceptionate.shutdown();
+        self.base.signal_set(Signal::JOB_TERMINATED);
+        if let Some(parent) = self.parent.as_ref() {
+            parent.remove_child(&self.inner.lock().self_ref)
+        }
+    }
+}
+
+impl Task for Job {
+    /// Kill the job. The job do not terminate immediately when killed.
+    /// It will terminate after all its children and processes are terminated.
+    fn kill(&self) {
+        let (children, processes) = {
+            let mut inner = self.inner.lock();
+            if inner.killed {
+                return;
+            }
+            inner.killed = true;
+            (inner.children.clone(), inner.processes.clone())
+        };
+        if children.is_empty() && processes.is_empty() {
+            self.terminate();
+            return;
+        }
+        for child in children {
+            if let Some(child) = child.upgrade() {
+                child.kill();
+            }
+        }
+        for proc in processes {
+            proc.kill();
+        }
+    }
+
+    fn suspend(&self) {
+        panic!("job do not support suspend");
+    }
+
+    fn resume(&self) {
+        panic!("job do not support resume");
+    }
+
+    fn exceptionate(&self) -> Arc<Exceptionate> {
+        self.exceptionate.clone()
+    }
+
+    fn debug_exceptionate(&self) -> Arc<Exceptionate> {
+        self.debug_exceptionate.clone()
     }
 }
 
@@ -202,6 +279,13 @@ impl JobInner {
     }
 }
 
+impl Drop for Job {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+/// Information of a job.
 #[repr(C)]
 #[derive(Default)]
 pub struct JobInfo {
@@ -215,11 +299,24 @@ pub struct JobInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task::{CurrentThread, Status, Thread, ThreadState, TASK_RETCODE_SYSCALL_KILL};
 
     #[test]
     fn create() {
         let root_job = Job::root();
-        let _job = Job::create_child(&root_job, 0).expect("failed to create job");
+        let job = Job::create_child(&root_job).expect("failed to create job");
+
+        let child = root_job
+            .get_child(job.id())
+            .unwrap()
+            .downcast_arc()
+            .unwrap();
+        assert!(Arc::ptr_eq(&child, &job));
+        assert_eq!(job.related_koid(), root_job.id());
+        assert_eq!(root_job.related_koid(), 0);
+
+        root_job.kill();
+        assert_eq!(root_job.create_child().err(), Some(ZxError::BAD_STATE));
     }
 
     #[test]
@@ -259,7 +356,7 @@ mod tests {
         );
 
         // create a child job
-        let job = Job::create_child(&root_job, 0).expect("failed to create job");
+        let job = Job::create_child(&root_job).expect("failed to create job");
 
         // should inherit parent's policy.
         assert_eq!(
@@ -305,17 +402,112 @@ mod tests {
     }
 
     #[test]
-    fn get_child() {
+    fn parent_child() {
         let root_job = Job::root();
-        let job = Job::create_child(&root_job, 0).expect("failed to create job");
-        let proc = Process::create(&root_job, "proc", 0).expect("failed to create process");
+        let job = Job::create_child(&root_job).expect("failed to create job");
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
 
-        let root_job: Arc<dyn KernelObject> = root_job;
         assert_eq!(root_job.get_child(job.id()).unwrap().id(), job.id());
         assert_eq!(root_job.get_child(proc.id()).unwrap().id(), proc.id());
         assert_eq!(
             root_job.get_child(root_job.id()).err(),
             Some(ZxError::NOT_FOUND)
         );
+        assert!(Arc::ptr_eq(&job.parent().unwrap(), &root_job));
+
+        let job1 = root_job.create_child().expect("failed to create job");
+        let proc1 = Process::create(&root_job, "proc1").expect("failed to create process");
+        assert_eq!(root_job.children_ids(), vec![job.id(), job1.id()]);
+        assert_eq!(root_job.process_ids(), vec![proc.id(), proc1.id()]);
+
+        root_job.kill();
+        assert_eq!(root_job.create_child().err(), Some(ZxError::BAD_STATE));
+    }
+
+    #[test]
+    fn check() {
+        let root_job = Job::root();
+        assert!(root_job.is_empty());
+        let job = root_job.create_child().expect("failed to create job");
+        assert_eq!(root_job.check_root_job(), Ok(()));
+        assert_eq!(job.check_root_job(), Err(ZxError::ACCESS_DENIED));
+
+        assert!(!root_job.is_empty());
+        assert!(job.is_empty());
+
+        let _proc = Process::create(&job, "proc").expect("failed to create process");
+        assert!(!job.is_empty());
+    }
+
+    #[test]
+    fn kill() {
+        let root_job = Job::root();
+        let job = Job::create_child(&root_job).expect("failed to create job");
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let thread = Thread::create(&proc, "thread").expect("failed to create thread");
+        let current_thread = CurrentThread(thread.clone());
+
+        root_job.kill();
+        assert!(root_job.inner.lock().killed);
+        assert!(job.inner.lock().killed);
+        assert_eq!(proc.status(), Status::Exited(TASK_RETCODE_SYSCALL_KILL));
+        assert_eq!(thread.state(), ThreadState::Dying);
+        // killed but not terminated, since `CurrentThread` not dropped.
+        assert!(!root_job.signal().contains(Signal::JOB_TERMINATED));
+        assert!(job.signal().contains(Signal::JOB_TERMINATED)); // but the lonely job is terminated
+        assert!(!proc.signal().contains(Signal::PROCESS_TERMINATED));
+        assert!(!thread.signal().contains(Signal::THREAD_TERMINATED));
+
+        std::mem::drop(current_thread);
+        assert!(root_job.inner.lock().killed);
+        assert!(job.inner.lock().killed);
+        assert_eq!(proc.status(), Status::Exited(TASK_RETCODE_SYSCALL_KILL));
+        assert_eq!(thread.state(), ThreadState::Dead);
+        // all terminated now
+        assert!(root_job.signal().contains(Signal::JOB_TERMINATED));
+        assert!(job.signal().contains(Signal::JOB_TERMINATED));
+        assert!(proc.signal().contains(Signal::PROCESS_TERMINATED));
+        assert!(thread.signal().contains(Signal::THREAD_TERMINATED));
+
+        // The job has no children.
+        let root_job = Job::root();
+        root_job.kill();
+        assert!(root_job.inner.lock().killed);
+        assert!(root_job.signal().contains(Signal::JOB_TERMINATED));
+
+        // The job's process have no threads.
+        let root_job = Job::root();
+        let job = Job::create_child(&root_job).expect("failed to create job");
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        root_job.kill();
+        assert!(root_job.inner.lock().killed);
+        assert!(job.inner.lock().killed);
+        assert_eq!(proc.status(), Status::Exited(TASK_RETCODE_SYSCALL_KILL));
+        assert!(root_job.signal().contains(Signal::JOB_TERMINATED));
+        assert!(job.signal().contains(Signal::JOB_TERMINATED));
+        assert!(proc.signal().contains(Signal::PROCESS_TERMINATED));
+    }
+
+    #[test]
+    fn critical_process() {
+        let root_job = Job::root();
+        let job = root_job.create_child().unwrap();
+        let job1 = root_job.create_child().unwrap();
+
+        let proc = Process::create(&job, "proc").expect("failed to create process");
+
+        assert_eq!(
+            proc.set_critical_at_job(&job1, true).err(),
+            Some(ZxError::INVALID_ARGS)
+        );
+        proc.set_critical_at_job(&root_job, true).unwrap();
+        assert_eq!(
+            proc.set_critical_at_job(&job, true).err(),
+            Some(ZxError::ALREADY_BOUND)
+        );
+
+        proc.exit(666);
+        assert!(root_job.inner.lock().killed);
+        assert!(root_job.signal().contains(Signal::JOB_TERMINATED));
     }
 }

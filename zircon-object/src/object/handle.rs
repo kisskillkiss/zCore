@@ -9,15 +9,19 @@ pub const INVALID_HANDLE: HandleValue = 0;
 /// A Handle is how a specific process refers to a specific kernel object.
 #[derive(Debug, Clone)]
 pub struct Handle {
+    /// The object referred to by the handle.
     pub object: Arc<dyn KernelObject>,
+    /// The handle's associated rights.
     pub rights: Rights,
 }
 
 impl Handle {
+    /// Create a new handle referring to the given object with given rights.
     pub fn new(object: Arc<dyn KernelObject>, rights: Rights) -> Self {
         Handle { object, rights }
     }
 
+    /// Get information about the provided handle and the object the handle refers to.
     pub fn get_info(&self) -> HandleBasicInfo {
         HandleBasicInfo {
             koid: self.object.id(),
@@ -33,6 +37,9 @@ impl Handle {
         }
     }
 
+    /// Get information about the handle itself.
+    ///
+    /// The returned `HandleInfo`'s `handle` field should set manually.
     pub fn get_handle_info(&self) -> HandleInfo {
         HandleInfo {
             obj_type: obj_type(&self.object),
@@ -42,6 +49,7 @@ impl Handle {
     }
 }
 
+/// Information about a handle and the object it refers to.
 #[repr(C)]
 #[derive(Default, Debug)]
 pub struct HandleBasicInfo {
@@ -53,6 +61,7 @@ pub struct HandleBasicInfo {
     padding: u32,
 }
 
+/// Get an object's type.
 pub fn obj_type(object: &Arc<dyn KernelObject>) -> u32 {
     match object.type_name() {
         "Process" => 1,
@@ -79,18 +88,53 @@ pub fn obj_type(object: &Arc<dyn KernelObject>) -> u32 {
         "Pmt" => 26,
         "SuspendToken" => 27,
         "Pager" => 28,
-        "Exception" => 29,
+        "Exception" | "ExceptionObject" => 29,
         "Clock" => 30,
         "Stream" => 31,
+        "PcieDeviceKObject" => 32,
         _ => unimplemented!("unknown type"),
     }
 }
 
+/// Information about a handle itself, including its `HandleValue`.
 #[repr(C)]
 #[derive(Default, Debug)]
 pub struct HandleInfo {
+    /// The handle's value in user space.
     pub handle: HandleValue,
     obj_type: u32,
     rights: u32,
     unused: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "unknown type")]
+    fn test_ojb_type_unknown() {
+        let obj: Arc<dyn KernelObject> = DummyObject::new();
+        assert_eq!(1, obj_type(&obj));
+    }
+
+    #[test]
+    fn test_get_info() {
+        let obj = crate::task::Job::root();
+        let handle1 = Handle::new(obj.clone(), Rights::DEFAULT_JOB);
+        let info1 = handle1.get_info();
+        assert_eq!(info1.obj_type, 17);
+        assert_eq!(info1.props, 1);
+
+        let handle_info = handle1.get_handle_info();
+        assert_eq!(handle_info.obj_type, 17);
+
+        let handle2 = Handle::new(obj, Rights::READ);
+        let info2 = handle2.get_info();
+        assert_eq!(info2.props, 0);
+
+        // Let struct lines counted covered.
+        // See https://github.com/mozilla/grcov/issues/450
+        let _ = HandleBasicInfo::default();
+    }
 }

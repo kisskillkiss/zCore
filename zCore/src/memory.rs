@@ -30,7 +30,7 @@ static PMEM_BASE: usize = PHYSICAL_MEMORY_OFFSET;
 
 pub fn init_frame_allocator(boot_info: &BootInfo) {
     let mut ba = FRAME_ALLOCATOR.lock();
-    for region in boot_info.memory_map.clone().iter {
+    for region in boot_info.memory_map.iter() {
         if region.ty == MemoryType::CONVENTIONAL {
             let start_frame = region.phys_start as usize / PAGE_SIZE;
             let end_frame = start_frame + region.page_count as usize;
@@ -53,6 +53,7 @@ pub fn init_heap() {
 }
 
 #[no_mangle]
+#[allow(improper_ctypes_definitions)]
 pub extern "C" fn hal_frame_alloc() -> Option<usize> {
     // get the real address of the alloc frame
     let ret = FRAME_ALLOCATOR
@@ -60,6 +61,21 @@ pub extern "C" fn hal_frame_alloc() -> Option<usize> {
         .alloc()
         .map(|id| id * PAGE_SIZE + MEMORY_OFFSET);
     trace!("Allocate frame: {:x?}", ret);
+    ret
+}
+
+#[no_mangle]
+#[allow(improper_ctypes_definitions)]
+pub extern "C" fn hal_frame_alloc_contiguous(page_num: usize, align_log2: usize) -> Option<usize> {
+    let ret = FRAME_ALLOCATOR
+        .lock()
+        .alloc_contiguous(page_num, align_log2)
+        .map(|id| id * PAGE_SIZE + MEMORY_OFFSET);
+    trace!(
+        "Allocate contiguous frames: {:x?} ~ {:x?}",
+        ret,
+        ret.map(|x| x + page_num)
+    );
     ret
 }
 
@@ -77,6 +93,38 @@ pub extern "C" fn hal_pt_map_kernel(pt: &mut PageTable, current: &PageTable) {
     let ephysical = current[PHYSICAL_MEMORY_PM4].clone();
     pt[KERNEL_PM4].set_addr(ekernel.addr(), ekernel.flags() | EF::GLOBAL);
     pt[PHYSICAL_MEMORY_PM4].set_addr(ephysical.addr(), ephysical.flags() | EF::GLOBAL);
+}
+
+#[cfg(feature = "hypervisor")]
+mod rvm_extern_fn {
+    use super::*;
+
+    #[rvm::extern_fn(alloc_frame)]
+    fn rvm_alloc_frame() -> Option<usize> {
+        hal_frame_alloc()
+    }
+
+    #[rvm::extern_fn(dealloc_frame)]
+    fn rvm_dealloc_frame(paddr: usize) {
+        hal_frame_dealloc(&paddr)
+    }
+
+    #[rvm::extern_fn(phys_to_virt)]
+    fn rvm_phys_to_virt(paddr: usize) -> usize {
+        paddr + PHYSICAL_MEMORY_OFFSET
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[rvm::extern_fn(is_host_timer_interrupt)]
+    fn rvm_is_host_timer_interrupt(vector: u8) -> bool {
+        vector == 32 // IRQ0 + Timer in kernel-hal-bare/src/arch/x86_64/interrupt.rs
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[rvm::extern_fn(is_host_serial_interrupt)]
+    fn rvm_is_host_serial_interrupt(vector: u8) -> bool {
+        vector == 36 // IRQ0 + COM1 in kernel-hal-bare/src/arch/x86_64/interrupt.rs
+    }
 }
 
 /// Global heap allocator

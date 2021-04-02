@@ -8,6 +8,10 @@ use super::*;
 use linux_object::fs::vfs::{FileType, Metadata};
 
 impl Syscall<'_> {
+    /// Works exactly like the stat syscall, but if the file in question is a symbolic link,
+    /// information on the link is returned rather than its target.
+    /// - `path` – full path to file
+    /// - `stat_ptr` – pointer to stat buffer
     pub fn sys_lstat(&self, path: UserInPtr<u8>, stat_ptr: UserOutPtr<Stat>) -> SysResult {
         self.sys_fstatat(
             FileDesc::CWD,
@@ -17,15 +21,19 @@ impl Syscall<'_> {
         )
     }
 
+    /// Works exactly like the stat syscall except a file descriptor (fd) is provided instead of a path.
+    /// - `fd` – file descriptor
+    /// - `stat_ptr` – pointer to stat buffer
     pub fn sys_fstat(&self, fd: FileDesc, mut stat_ptr: UserOutPtr<Stat>) -> SysResult {
         info!("fstat: fd={:?}, stat_ptr={:?}", fd, stat_ptr);
-        let proc = self.lock_linux_process();
+        let proc = self.linux_process();
         let file = proc.get_file(fd)?;
         let stat = Stat::from(file.metadata()?);
         stat_ptr.write(stat)?;
         Ok(0)
     }
 
+    /// get file status relative to a directory file descriptor
     pub fn sys_fstatat(
         &self,
         dirfd: FileDesc,
@@ -40,7 +48,7 @@ impl Syscall<'_> {
             dirfd, path, stat_ptr, flags
         );
 
-        let proc = self.lock_linux_process();
+        let proc = self.linux_process();
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
         let inode = proc.lookup_inode_at(dirfd, &path, follow)?;
         let stat = Stat::from(inode.metadata()?);
@@ -48,6 +56,9 @@ impl Syscall<'_> {
         Ok(0)
     }
 
+    /// Returns information about a file in a structure named stat.
+    /// - `path` – pointer to the name of the file
+    /// - `stat_ptr` –  pointer to the structure to receive file information
     pub fn sys_stat(&self, path: UserInPtr<u8>, stat_ptr: UserOutPtr<Stat>) -> SysResult {
         self.sys_fstatat(FileDesc::CWD, path, stat_ptr, 0)
     }
@@ -189,7 +200,7 @@ pub struct Stat {
 }
 
 impl From<Metadata> for Stat {
-    #[allow(clippy::identity_conversion)]
+    #[allow(clippy::useless_conversion)]
     fn from(info: Metadata) -> Self {
         Stat {
             dev: info.dev as u64,

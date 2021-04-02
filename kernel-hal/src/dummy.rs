@@ -1,12 +1,21 @@
 use super::*;
 use crate::vdso::VdsoConstants;
+use acpi::Acpi;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::future::Future;
 use core::ops::FnOnce;
 use core::pin::Pin;
 use core::time::Duration;
 
 type ThreadId = usize;
+
+/// The error type which is returned from HAL functions.
+#[derive(Debug)]
+pub struct HalError;
+
+/// The result type returned by HAL functions.
+pub type Result<T> = core::result::Result<T, HalError>;
 
 #[repr(C)]
 pub struct Thread {
@@ -45,6 +54,58 @@ pub fn context_run(_context: &mut UserContext) {
     unimplemented!()
 }
 
+pub trait PageTableTrait: Sync + Send {
+    /// Map the page of `vaddr` to the frame of `paddr` with `flags`.
+    fn map(&mut self, _vaddr: VirtAddr, _paddr: PhysAddr, _flags: MMUFlags) -> Result<()>;
+
+    /// Unmap the page of `vaddr`.
+    fn unmap(&mut self, _vaddr: VirtAddr) -> Result<()>;
+
+    /// Change the `flags` of the page of `vaddr`.
+    fn protect(&mut self, _vaddr: VirtAddr, _flags: MMUFlags) -> Result<()>;
+
+    /// Query the physical address which the page of `vaddr` maps to.
+    fn query(&mut self, _vaddr: VirtAddr) -> Result<PhysAddr>;
+
+    /// Get the physical address of root page table.
+    fn table_phys(&self) -> PhysAddr;
+
+    fn map_many(
+        &mut self,
+        mut vaddr: VirtAddr,
+        paddrs: &[PhysAddr],
+        flags: MMUFlags,
+    ) -> Result<()> {
+        for &paddr in paddrs {
+            self.map(vaddr, paddr, flags)?;
+            vaddr += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
+    fn map_cont(
+        &mut self,
+        mut vaddr: VirtAddr,
+        paddr: PhysAddr,
+        pages: usize,
+        flags: MMUFlags,
+    ) -> Result<()> {
+        for i in 0..pages {
+            let paddr = paddr + i * PAGE_SIZE;
+            self.map(vaddr, paddr, flags)?;
+            vaddr += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
+    fn unmap_cont(&mut self, vaddr: VirtAddr, pages: usize) -> Result<()> {
+        for i in 0..pages {
+            self.unmap(vaddr + i * PAGE_SIZE)?;
+        }
+        Ok(())
+    }
+}
+
 /// Page Table
 #[repr(C)]
 pub struct PageTable {
@@ -66,66 +127,42 @@ impl PageTable {
     pub fn new() -> Self {
         unimplemented!()
     }
+}
+
+impl PageTableTrait for PageTable {
     /// Map the page of `vaddr` to the frame of `paddr` with `flags`.
     #[linkage = "weak"]
     #[export_name = "hal_pt_map"]
-    pub fn map(&mut self, _vaddr: VirtAddr, _paddr: PhysAddr, _flags: MMUFlags) -> Result<(), ()> {
+    fn map(&mut self, _vaddr: VirtAddr, _paddr: PhysAddr, _flags: MMUFlags) -> Result<()> {
         unimplemented!()
     }
     /// Unmap the page of `vaddr`.
     #[linkage = "weak"]
     #[export_name = "hal_pt_unmap"]
-    pub fn unmap(&mut self, _vaddr: VirtAddr) -> Result<(), ()> {
+    fn unmap(&mut self, _vaddr: VirtAddr) -> Result<()> {
         unimplemented!()
     }
     /// Change the `flags` of the page of `vaddr`.
     #[linkage = "weak"]
     #[export_name = "hal_pt_protect"]
-    pub fn protect(&mut self, _vaddr: VirtAddr, _flags: MMUFlags) -> Result<(), ()> {
+    fn protect(&mut self, _vaddr: VirtAddr, _flags: MMUFlags) -> Result<()> {
         unimplemented!()
     }
     /// Query the physical address which the page of `vaddr` maps to.
     #[linkage = "weak"]
     #[export_name = "hal_pt_query"]
-    pub fn query(&mut self, _vaddr: VirtAddr) -> Result<PhysAddr, ()> {
+    fn query(&mut self, _vaddr: VirtAddr) -> Result<PhysAddr> {
         unimplemented!()
     }
     /// Get the physical address of root page table.
-    pub fn table_phys(&self) -> PhysAddr {
+    #[linkage = "weak"]
+    #[export_name = "hal_pt_table_phys"]
+    fn table_phys(&self) -> PhysAddr {
         self.table_phys
     }
-
-    pub fn map_many(
-        &mut self,
-        mut vaddr: VirtAddr,
-        paddrs: &[PhysAddr],
-        flags: MMUFlags,
-    ) -> Result<(), ()> {
-        for &paddr in paddrs {
-            self.map(vaddr, paddr, flags)?;
-            vaddr += PAGE_SIZE;
-        }
-        Ok(())
-    }
-
-    pub fn map_cont(
-        &mut self,
-        mut vaddr: VirtAddr,
-        paddr: PhysAddr,
-        pages: usize,
-        flags: MMUFlags,
-    ) -> Result<(), ()> {
-        for i in 0..pages {
-            let paddr = paddr + i * PAGE_SIZE;
-            self.map(vaddr, paddr, flags)?;
-            vaddr += PAGE_SIZE;
-        }
-        Ok(())
-    }
-
     #[linkage = "weak"]
     #[export_name = "hal_pt_unmap_cont"]
-    pub fn unmap_cont(&mut self, vaddr: VirtAddr, pages: usize) -> Result<(), ()> {
+    fn unmap_cont(&mut self, vaddr: VirtAddr, pages: usize) -> Result<()> {
         for i in 0..pages {
             self.unmap(vaddr + i * PAGE_SIZE)?;
         }
@@ -141,8 +178,24 @@ pub struct PhysFrame {
 impl PhysFrame {
     #[linkage = "weak"]
     #[export_name = "hal_frame_alloc"]
-    pub extern "C" fn alloc() -> Option<Self> {
+    pub fn alloc() -> Option<Self> {
         unimplemented!()
+    }
+
+    #[linkage = "weak"]
+    #[export_name = "hal_frame_alloc_contiguous"]
+    pub fn alloc_contiguous_base(_size: usize, _align_log2: usize) -> Option<PhysAddr> {
+        unimplemented!()
+    }
+
+    pub fn alloc_contiguous(size: usize, align_log2: usize) -> Vec<Self> {
+        PhysFrame::alloc_contiguous_base(size, align_log2).map_or(Vec::new(), |base| {
+            (0..size)
+                .map(|i| PhysFrame {
+                    paddr: base + i * PAGE_SIZE,
+                })
+                .collect()
+        })
     }
 
     pub fn addr(&self) -> PhysAddr {
@@ -202,7 +255,7 @@ pub fn frame_flush(_target: PhysAddr) {
 /// Register a callback of serial readable event.
 #[linkage = "weak"]
 #[export_name = "hal_serial_set_callback"]
-pub fn serial_set_callback(_callback: Box<dyn FnOnce() + Send + Sync>) {
+pub fn serial_set_callback(_callback: Box<dyn Fn() -> bool + Send + Sync>) {
     unimplemented!()
 }
 
@@ -241,11 +294,90 @@ pub fn timer_tick() {
     unimplemented!()
 }
 
-/// Handle IRQ.
-#[linkage = "weak"]
-#[export_name = "hal_irq_handle"]
-pub fn irq_handle(_irq: u8) {
-    unimplemented!()
+pub struct InterruptManager {}
+impl InterruptManager {
+    /// Handle IRQ.
+    #[linkage = "weak"]
+    #[export_name = "hal_irq_handle"]
+    pub fn handle(_irq: u8) {
+        unimplemented!()
+    }
+    ///
+    #[linkage = "weak"]
+    #[export_name = "hal_ioapic_set_handle"]
+    pub fn set_ioapic_handle(_global_irq: u32, _handle: Box<dyn Fn() + Send + Sync>) -> Option<u8> {
+        unimplemented!()
+    }
+    /// Add an interrupt handle to an irq
+    #[linkage = "weak"]
+    #[export_name = "hal_irq_add_handle"]
+    pub fn add_handle(_global_irq: u8, _handle: Box<dyn Fn() + Send + Sync>) -> Option<u8> {
+        unimplemented!()
+    }
+    ///
+    #[linkage = "weak"]
+    #[export_name = "hal_ioapic_reset_handle"]
+    pub fn reset_ioapic_handle(_global_irq: u32) -> bool {
+        unimplemented!()
+    }
+    /// Remove the interrupt handle of an irq
+    #[linkage = "weak"]
+    #[export_name = "hal_irq_remove_handle"]
+    pub fn remove_handle(_irq: u8) -> bool {
+        unimplemented!()
+    }
+    /// Allocate contiguous positions for irq
+    #[linkage = "weak"]
+    #[export_name = "hal_irq_allocate_block"]
+    pub fn allocate_block(_irq_num: u32) -> Option<(usize, usize)> {
+        unimplemented!()
+    }
+    #[linkage = "weak"]
+    #[export_name = "hal_irq_free_block"]
+    pub fn free_block(_irq_start: u32, _irq_num: u32) {
+        unimplemented!()
+    }
+    #[linkage = "weak"]
+    #[export_name = "hal_irq_overwrite_handler"]
+    pub fn overwrite_handler(_msi_id: u32, _handle: Box<dyn Fn() + Send + Sync>) -> bool {
+        unimplemented!()
+    }
+
+    /// Enable IRQ.
+    #[linkage = "weak"]
+    #[export_name = "hal_irq_enable"]
+    pub fn enable(_global_irq: u32) {
+        unimplemented!()
+    }
+
+    /// Disable IRQ.
+    #[linkage = "weak"]
+    #[export_name = "hal_irq_disable"]
+    pub fn disable(_global_irq: u32) {
+        unimplemented!()
+    }
+    /// Get IO APIC maxinstr
+    #[linkage = "weak"]
+    #[export_name = "hal_irq_maxinstr"]
+    pub fn maxinstr(_irq: u32) -> Option<u8> {
+        unimplemented!()
+    }
+    #[linkage = "weak"]
+    #[export_name = "hal_irq_configure"]
+    pub fn configure(
+        _irq: u32,
+        _vector: u8,
+        _dest: u8,
+        _level_trig: bool,
+        _active_high: bool,
+    ) -> bool {
+        unimplemented!()
+    }
+    #[linkage = "weak"]
+    #[export_name = "hal_irq_isvalid"]
+    pub fn is_valid(_irq: u32) -> bool {
+        unimplemented!()
+    }
 }
 
 /// Get platform specific information.
@@ -267,4 +399,49 @@ pub fn fetch_fault_vaddr() -> VirtAddr {
 #[export_name = "hal_pc_firmware_tables"]
 pub fn pc_firmware_tables() -> (u64, u64) {
     unimplemented!()
+}
+
+/// Get ACPI Table
+#[linkage = "weak"]
+#[export_name = "hal_acpi_table"]
+pub fn get_acpi_table() -> Option<Acpi> {
+    unimplemented!()
+}
+
+/// IO Ports access on x86 platform
+#[linkage = "weak"]
+#[export_name = "hal_outpd"]
+pub fn outpd(_port: u16, _value: u32) {
+    unimplemented!()
+}
+
+#[linkage = "weak"]
+#[export_name = "hal_inpd"]
+pub fn inpd(_port: u16) -> u32 {
+    unimplemented!()
+}
+
+/// Get local APIC ID
+#[linkage = "weak"]
+#[export_name = "hal_apic_local_id"]
+pub fn apic_local_id() -> u8 {
+    unimplemented!()
+}
+
+/// Fill random bytes to the buffer
+#[cfg(target_arch = "x86_64")]
+pub fn fill_random(buf: &mut [u8]) {
+    // TODO: optimize
+    for x in buf.iter_mut() {
+        let mut r = 0;
+        unsafe {
+            core::arch::x86_64::_rdrand16_step(&mut r);
+        }
+        *x = r as _;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn fill_random(_buf: &mut [u8]) {
+    // TODO
 }

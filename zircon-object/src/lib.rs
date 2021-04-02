@@ -1,14 +1,17 @@
 //! Zircon kernel objects
+//!
+//! # Feature flags
+//!
+//! - `elf`: Enables `zircon_object::util::elf_loader`.
+//! - `hypervisor`: Enables `zircon_object::hypervisor` (`Guest` and `Vcpu`).
 
 #![no_std]
-#![deny(warnings, unsafe_code, unused_must_use)]
+#![deny(warnings, unsafe_code, unused_must_use, missing_docs)]
 #![feature(asm)]
 #![feature(linkage)]
 #![feature(drain_filter)]
 #![feature(get_mut_unchecked)]
 #![feature(naked_functions)]
-#![feature(ptr_offset_from)]
-#![feature(range_is_empty)]
 #![feature(new_uninit)]
 
 extern crate alloc;
@@ -23,7 +26,8 @@ extern crate std;
 pub mod debuglog;
 pub mod dev;
 mod error;
-pub mod exception;
+#[cfg(feature = "hypervisor")]
+pub mod hypervisor;
 pub mod ipc;
 pub mod object;
 pub mod signal;

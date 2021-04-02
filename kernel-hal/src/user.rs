@@ -2,6 +2,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Formatter};
 use core::marker::PhantomData;
+use core::ops::{Deref, DerefMut};
 
 #[repr(C)]
 pub struct UserPtr<T, P: Policy> {
@@ -35,6 +36,9 @@ type Result<T> = core::result::Result<T, Error>;
 pub enum Error {
     InvalidUtf8,
     InvalidPointer,
+    BufferTooSmall,
+    InvalidLength,
+    InvalidVectorAddress,
 }
 
 impl<T, P: Policy> Debug for UserPtr<T, P> {
@@ -57,6 +61,13 @@ impl<T, P: Policy> From<usize> for UserPtr<T, P> {
 }
 
 impl<T, P: Policy> UserPtr<T, P> {
+    pub fn from_addr_size(addr: usize, size: usize) -> Result<Self> {
+        if size < core::mem::size_of::<T>() {
+            return Err(Error::BufferTooSmall);
+        }
+        Ok(Self::from(addr))
+    }
+
     pub fn is_null(&self) -> bool {
         self.ptr.is_null()
     }
@@ -74,6 +85,9 @@ impl<T, P: Policy> UserPtr<T, P> {
 
     pub fn check(&self) -> Result<()> {
         if self.ptr.is_null() {
+            return Err(Error::InvalidPointer);
+        }
+        if (self.ptr as usize) % core::mem::align_of::<T>() != 0 {
             return Err(Error::InvalidPointer);
         }
         Ok(())
@@ -180,5 +194,123 @@ impl<P: Write> UserPtr<u8, P> {
             self.ptr.add(bytes.len()).write(0);
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct IoVec<P: Policy> {
+    /// Starting address
+    ptr: UserPtr<u8, P>,
+    /// Number of bytes to transfer
+    len: usize,
+}
+
+pub type IoVecIn = IoVec<In>;
+pub type IoVecOut = IoVec<Out>;
+
+/// A valid IoVecs request from user
+#[derive(Debug)]
+pub struct IoVecs<P: Policy> {
+    vec: Vec<IoVec<P>>,
+}
+
+impl<P: Policy> UserInPtr<IoVec<P>> {
+    pub fn read_iovecs(&self, count: usize) -> Result<IoVecs<P>> {
+        if self.ptr.is_null() {
+            return Err(Error::InvalidPointer);
+        }
+        let vec = self.read_array(count)?;
+        // The sum of length should not overflow.
+        let mut total_count = 0usize;
+        for io_vec in vec.iter() {
+            let (result, overflow) = total_count.overflowing_add(io_vec.len());
+            if overflow {
+                return Err(Error::InvalidLength);
+            }
+            total_count = result;
+        }
+        Ok(IoVecs { vec })
+    }
+}
+
+impl<P: Policy> IoVecs<P> {
+    pub fn total_len(&self) -> usize {
+        self.vec.iter().map(|vec| vec.len).sum()
+    }
+}
+
+impl<P: Read> IoVecs<P> {
+    pub fn read_to_vec(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        for vec in self.vec.iter() {
+            buf.extend(vec.ptr.read_array(vec.len)?);
+        }
+        Ok(buf)
+    }
+}
+
+impl<P: Write> IoVecs<P> {
+    pub fn write_from_buf(&mut self, mut buf: &[u8]) -> Result<usize> {
+        let buf_len = buf.len();
+        for vec in self.vec.iter_mut() {
+            let copy_len = vec.len.min(buf.len());
+            if copy_len == 0 {
+                continue;
+            }
+            vec.ptr.write_array(&buf[..copy_len])?;
+            buf = &buf[copy_len..];
+        }
+        Ok(buf_len - buf.len())
+    }
+}
+
+impl<P: Policy> Deref for IoVecs<P> {
+    type Target = [IoVec<P>];
+
+    fn deref(&self) -> &Self::Target {
+        self.vec.as_slice()
+    }
+}
+
+impl<P: Write> DerefMut for IoVecs<P> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.vec.as_mut_slice()
+    }
+}
+
+impl<P: Policy> IoVec<P> {
+    pub fn is_null(&self) -> bool {
+        self.ptr.is_null()
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn check(&self) -> Result<()> {
+        self.ptr.check()
+    }
+
+    pub fn as_slice(&self) -> Result<&[u8]> {
+        if self.ptr.is_null() {
+            return Err(Error::InvalidVectorAddress);
+        }
+        let slice = unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) };
+        Ok(slice)
+    }
+}
+
+impl<P: Write> IoVec<P> {
+    pub fn as_mut_slice(&mut self) -> Result<&mut [u8]> {
+        if self.ptr.is_null() {
+            return Err(Error::InvalidVectorAddress);
+        }
+        let slice = unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) };
+        Ok(slice)
     }
 }

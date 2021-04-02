@@ -1,7 +1,8 @@
 //! Linux kernel objects
 
 #![no_std]
-#![deny(warnings, unsafe_code, unused_must_use, unreachable_patterns)]
+#![deny(warnings, unsafe_code, missing_docs)]
+#![allow(clippy::upper_case_acronyms)]
 #![feature(bool_to_option)]
 
 extern crate alloc;
@@ -16,6 +17,10 @@ pub mod error;
 pub mod fs;
 
 // layer 2
+pub mod ipc;
 pub mod loader;
 pub mod process;
+pub mod signal;
+pub mod sync;
 pub mod thread;
+pub mod time;

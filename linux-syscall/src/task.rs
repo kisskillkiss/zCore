@@ -1,23 +1,40 @@
 //! Syscalls for process
+//!
+//! - fork
+//! - vfork
+//! - clone
+//! - wait4
+//! - execve
+//! - gettid
+//! - getpid
+//! - getppid
 
 use super::*;
 use bitflags::bitflags;
+use core::fmt::Debug;
 use linux_object::fs::INodeExt;
 use linux_object::loader::LinuxElfLoader;
-use linux_object::thread::ThreadExt;
+use linux_object::thread::{CurrentThreadExt, ThreadExt};
+use linux_object::time::*;
 
 impl Syscall<'_> {
     /// Fork the current process. Return the child's PID.
-    pub async fn sys_fork(&self) -> SysResult {
-        warn!("fork: not supported! go to vfork");
-        self.sys_vfork().await
+    pub fn sys_fork(&self) -> SysResult {
+        info!("fork:");
+        let new_proc = Process::fork_from(self.zircon_process(), false)?;
+        let new_thread = Thread::create_linux(&new_proc)?;
+        new_thread.start_with_regs(GeneralRegs::new_fork(self.regs), self.thread_fn)?;
+
+        info!("fork: {} -> {}", self.zircon_process().id(), new_proc.id());
+        Ok(new_proc.id() as usize)
     }
 
+    /// creates a child process of the calling process, similar to fork but wait for execve
     pub async fn sys_vfork(&self) -> SysResult {
         info!("vfork:");
-        let new_proc = Process::vfork_from(self.zircon_process())?;
+        let new_proc = Process::fork_from(self.zircon_process(), true)?;
         let new_thread = Thread::create_linux(&new_proc)?;
-        new_thread.start_with_regs(GeneralRegs::new_fork(self.regs), self.spawn_fn)?;
+        new_thread.start_with_regs(GeneralRegs::new_fork(self.regs), self.thread_fn)?;
 
         let new_proc: Arc<dyn KernelObject> = new_proc;
         info!("vfork: {} -> {}", self.zircon_process().id(), new_proc.id());
@@ -56,7 +73,7 @@ impl Syscall<'_> {
         }
         let new_thread = Thread::create_linux(self.zircon_process())?;
         let regs = GeneralRegs::new_clone(self.regs, newsp, newtls);
-        new_thread.start_with_regs(regs, self.spawn_fn)?;
+        new_thread.start_with_regs(regs, self.thread_fn)?;
 
         let tid = new_thread.id();
         info!("clone: {} -> {}", self.thread.id(), tid);
@@ -130,13 +147,13 @@ impl Syscall<'_> {
         argv: UserInPtr<UserInPtr<u8>>,
         envp: UserInPtr<UserInPtr<u8>>,
     ) -> SysResult {
-        info!(
-            "execve: path: {:?}, argv: {:?}, envp: {:?}",
-            path, argv, envp
-        );
         let path = path.read_cstring()?;
         let args = argv.read_cstring_array()?;
         let envs = envp.read_cstring_array()?;
+        info!(
+            "execve: path: {:?}, argv: {:?}, envs: {:?}",
+            path, argv, envs
+        );
         if args.is_empty() {
             error!("execve: args is null");
             return Err(LxError::EINVAL);
@@ -145,9 +162,11 @@ impl Syscall<'_> {
         // TODO: check and kill other threads
 
         // Read program file
-        let mut proc = self.lock_linux_process();
+        let proc = self.linux_process();
         let inode = proc.lookup_inode(&path)?;
         let data = inode.read_as_vec()?;
+
+        proc.remove_cloexec_files();
 
         let vmar = self.zircon_process().vmar();
         vmar.clear()?;
@@ -156,11 +175,10 @@ impl Syscall<'_> {
             stack_pages: 8,
             root_inode: proc.root_inode().clone(),
         };
-        let (entry, sp) = loader.load(&vmar, &data, args, envs)?;
+        let (entry, sp) = loader.load(&vmar, &data, args, envs, path.clone())?;
 
         // Modify exec path
-        proc.exec_path = path.clone();
-        drop(proc);
+        proc.set_execute_path(&path);
 
         // TODO: use right signal
         self.zircon_process().signal_set(Signal::SIGNALED);
@@ -215,7 +233,7 @@ impl Syscall<'_> {
     /// Get the parent process ID.
     pub fn sys_getppid(&self) -> SysResult {
         info!("getppid:");
-        let proc = self.lock_linux_process();
+        let proc = self.linux_process();
         let ppid = proc.parent().map(|p| p.id()).unwrap_or(0);
         Ok(ppid as usize)
     }
@@ -224,7 +242,6 @@ impl Syscall<'_> {
     pub fn sys_exit(&mut self, exit_code: i32) -> SysResult {
         info!("exit: code={}", exit_code);
         self.thread.exit_linux(exit_code);
-        self.exit = true;
         Err(LxError::ENOSYS)
     }
 
@@ -233,24 +250,26 @@ impl Syscall<'_> {
         info!("exit_group: code={}", exit_code);
         let proc = self.zircon_process();
         proc.exit(exit_code as i64);
-        self.exit = true;
         Err(LxError::ENOSYS)
     }
 
-    //    pub fn sys_nanosleep(&self, req: *const TimeSpec) -> SysResult {
-    //        let time = unsafe { *self.vm().check_read_ptr(req)? };
-    //        info!("nanosleep: time: {:#?}", time);
-    //        // TODO: handle spurious wakeup
-    //        thread::sleep(time.to_duration());
-    //        Ok(0)
-    //    }
-    //
+    /// Allows the calling thread to sleep for
+    /// an interval specified with nanosecond precision
+    pub async fn sys_nanosleep(&self, req: UserInPtr<TimeSpec>) -> SysResult {
+        info!("nanosleep: deadline={:?}", req);
+        let req = req.read()?;
+        kernel_hal::sleep_until(req.into()).await;
+        Ok(0)
+    }
+
     //    pub fn sys_set_priority(&self, priority: usize) -> SysResult {
     //        let pid = thread::current().id();
     //        thread_manager().set_priority(pid, priority as u8);
     //        Ok(0)
     //    }
 
+    /// set pointer to thread ID
+    /// returns the caller's thread ID
     pub fn sys_set_tid_address(&self, tidptr: UserOutPtr<i32>) -> SysResult {
         info!("set_tid_address: {:?}", tidptr);
         self.thread.set_tid_address(tidptr);
@@ -261,29 +280,53 @@ impl Syscall<'_> {
 
 bitflags! {
     pub struct CloneFlags: usize {
+        ///
         const CSIGNAL =         0xff;
+        /// the calling process and the child process run in the same memory space
         const VM =              1 << 8;
+        /// the caller and the child process share the same filesystem information
         const FS =              1 << 9;
+        /// the calling process and the child process share the same file descriptor table
         const FILES =           1 << 10;
+        /// the calling process and the child process share the same table of signal handlers.
         const SIGHAND =         1 << 11;
+        /// the calling process is being traced
         const PTRACE =          1 << 13;
+        /// the execution of the calling process is suspended until the child releases its virtual memory resources
         const VFORK =           1 << 14;
+        /// the parent of the new child will be the same as that of the call‐ing process.
         const PARENT =          1 << 15;
+        /// the child is placed in the same thread group as the calling process.
         const THREAD =          1 << 16;
+        /// cloned child is started in a new mount namespace
         const NEWNS	=           1 << 17;
+        /// the child and the calling process share a single list of System V semaphore adjustment values.
         const SYSVSEM =         1 << 18;
+        /// architecture dependent, The TLS (Thread Local Storage) descriptor is set to tls.
         const SETTLS =          1 << 19;
+        /// Store the child thread ID at the location in the parent's memory.
         const PARENT_SETTID =   1 << 20;
+        /// Clear (zero) the child thread ID
         const CHILD_CLEARTID =  1 << 21;
+        /// the parent not to receive a signal when the child terminated
         const DETACHED =        1 << 22;
+        /// a tracing process cannot force CLONE_PTRACE on this child process.
         const UNTRACED =        1 << 23;
+        /// Store the child thread ID
         const CHILD_SETTID =    1 << 24;
+        /// Create the process in a new cgroup namespace.
         const NEWCGROUP =       1 << 25;
+        /// create the process in a new UTS namespace
         const NEWUTS =          1 << 26;
+        /// create the process in a new IPC namespace.
         const NEWIPC =          1 << 27;
+        /// create the process in a new user namespace
         const NEWUSER =         1 << 28;
+        /// create the process in a new PID namespace
         const NEWPID =          1 << 29;
+        /// create the process in a new net‐work namespace.
         const NEWNET =          1 << 30;
+        /// the new process shares an I/O context with the calling process.
         const IO =              1 << 31;
     }
 }

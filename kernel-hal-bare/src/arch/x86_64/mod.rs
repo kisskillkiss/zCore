@@ -1,19 +1,26 @@
 use {
     super::super::*,
+    acpi::{parse_rsdp, Acpi, AcpiHandler, PhysicalMapping},
     alloc::{collections::VecDeque, vec::Vec},
-    apic::{IoApic, LocalApic, XApic},
+    apic::{LocalApic, XApic},
+    core::arch::x86_64::{__cpuid, _mm_clflush, _mm_mfence},
     core::convert::TryFrom,
     core::fmt::{Arguments, Write},
+    core::ptr::NonNull,
     core::time::Duration,
+    git_version::git_version,
+    kernel_hal::{Result, HalError, PageTableTrait},
     rcore_console::{Console, ConsoleOnGraphic, DrawTarget, Pixel, Rgb888, Size},
     spin::Mutex,
     uart_16550::SerialPort,
     x86_64::{
+        instructions::port::Port,
         registers::control::{Cr2, Cr3, Cr3Flags, Cr4, Cr4Flags},
         structures::paging::{PageTableFlags as PTF, *},
     },
 };
 
+mod acpi_table;
 mod interrupt;
 mod keyboard;
 
@@ -46,51 +53,79 @@ impl PageTableImpl {
         }
     }
 
+    fn get(&mut self) -> OffsetPageTable<'_> {
+        let root_vaddr = phys_to_virt(self.root_paddr);
+        let root = unsafe { &mut *(root_vaddr as *mut PageTable) };
+        let offset = x86_64::VirtAddr::new(phys_to_virt(0) as u64);
+        unsafe { OffsetPageTable::new(root, offset) }
+    }
+}
+
+impl PageTableTrait for PageTableImpl {
     /// Map the page of `vaddr` to the frame of `paddr` with `flags`.
     #[export_name = "hal_pt_map"]
-    pub fn map(
-        &mut self,
-        vaddr: x86_64::VirtAddr,
-        paddr: x86_64::PhysAddr,
-        flags: MMUFlags,
-    ) -> Result<(), ()> {
+    fn map(&mut self, vaddr: VirtAddr, paddr: PhysAddr, flags: MMUFlags) -> Result<()> {
         let mut pt = self.get();
-        let page = Page::<Size4KiB>::from_start_address(vaddr).unwrap();
-        let frame = PhysFrame::from_start_address(paddr).unwrap();
-        let flush = unsafe {
-            pt.map_to(page, frame, flags.to_ptf(), &mut FrameAllocatorImpl)
-                .unwrap()
+        unsafe {
+            pt.map_to_with_table_flags(
+                Page::<Size4KiB>::from_start_address(x86_64::VirtAddr::new(vaddr as u64)).unwrap(),
+                PhysFrame::from_start_address(x86_64::PhysAddr::new(paddr as u64)).unwrap(),
+                flags.to_ptf(),
+                PTF::PRESENT | PTF::WRITABLE | PTF::USER_ACCESSIBLE,
+                &mut FrameAllocatorImpl,
+            )
+            .unwrap()
+            .flush();
         };
-        if flags.contains(MMUFlags::USER) {
-            self.allow_user_access(vaddr);
-        }
-        flush.flush();
-        trace!("map: {:x?} -> {:x?}, flags={:?}", vaddr, paddr, flags);
+        trace!(
+            "map: {:x?} -> {:x?}, flags={:?} in {:#x?}",
+            vaddr,
+            paddr,
+            flags,
+            self.root_paddr
+        );
         Ok(())
     }
 
     /// Unmap the page of `vaddr`.
     #[export_name = "hal_pt_unmap"]
-    pub fn unmap(&mut self, vaddr: x86_64::VirtAddr) -> Result<(), ()> {
+    fn unmap(&mut self, vaddr: VirtAddr) -> Result<()> {
         let mut pt = self.get();
-        let page = Page::<Size4KiB>::from_start_address(vaddr).unwrap();
-        if let Ok(pte) = pt.unmap(page) {
-            pte.1.flush();
+        let page =
+            Page::<Size4KiB>::from_start_address(x86_64::VirtAddr::new(vaddr as u64)).unwrap();
+        // This is a workaround to an issue in the x86-64 crate
+        // A page without PRESENT bit is not unmappable AND mapable
+        // So we add PRESENT bit here
+        unsafe {
+            pt.update_flags(page, PTF::PRESENT | PTF::NO_EXECUTE).ok();
         }
-        //pt.unmap(page).unwrap().1.flush();
-        trace!("unmap: {:x?}", vaddr);
+        match pt.unmap(page) {
+            Ok((_, flush)) => {
+                flush.flush();
+                trace!("unmap: {:x?} in {:#x?}", vaddr, self.root_paddr);
+            }
+            Err(mapper::UnmapError::PageNotMapped) => {
+                trace!("unmap not mapped, skip: {:x?} in {:#x?}", vaddr, self.root_paddr);
+                return Ok(())
+            }
+            Err(err) => {
+                debug!(
+                    "unmap failed: {:x?} err={:x?} in {:#x?}",
+                    vaddr, err, self.root_paddr
+                );
+                return Err(HalError);
+            }
+        }
         Ok(())
     }
 
     /// Change the `flags` of the page of `vaddr`.
     #[export_name = "hal_pt_protect"]
-    pub fn protect(&mut self, vaddr: x86_64::VirtAddr, flags: MMUFlags) -> Result<(), ()> {
+    fn protect(&mut self, vaddr: VirtAddr, flags: MMUFlags) -> Result<()> {
         let mut pt = self.get();
-        let page = Page::<Size4KiB>::from_start_address(vaddr).unwrap();
+        let page =
+            Page::<Size4KiB>::from_start_address(x86_64::VirtAddr::new(vaddr as u64)).unwrap();
         if let Ok(flush) = unsafe { pt.update_flags(page, flags.to_ptf()) } {
-            if flags.contains(MMUFlags::USER) {
-                self.allow_user_access(vaddr);
-            }
             flush.flush();
         }
         trace!("protect: {:x?}, flags={:?}", vaddr, flags);
@@ -99,35 +134,19 @@ impl PageTableImpl {
 
     /// Query the physical address which the page of `vaddr` maps to.
     #[export_name = "hal_pt_query"]
-    pub fn query(&mut self, vaddr: x86_64::VirtAddr) -> Result<x86_64::PhysAddr, ()> {
+    fn query(&mut self, vaddr: VirtAddr) -> Result<PhysAddr> {
         let pt = self.get();
-        let ret = pt.translate_addr(vaddr).ok_or(());
+        let ret = pt
+            .translate_addr(x86_64::VirtAddr::new(vaddr as u64))
+            .map(|addr| addr.as_u64() as PhysAddr).ok_or(HalError);
         trace!("query: {:x?} => {:x?}", vaddr, ret);
         ret
     }
 
-    fn get(&mut self) -> OffsetPageTable<'_> {
-        let root_vaddr = phys_to_virt(self.root_paddr);
-        let root = unsafe { &mut *(root_vaddr as *mut PageTable) };
-        let offset = x86_64::VirtAddr::new(phys_to_virt(0) as u64);
-        unsafe { OffsetPageTable::new(root, offset) }
-    }
-
-    /// Set user bit for 4-level PDEs of the page of `vaddr`.
-    ///
-    /// This is a workaround since `x86_64` crate does not set user bit for PDEs.
-    fn allow_user_access(&mut self, vaddr: x86_64::VirtAddr) {
-        let mut page_table = phys_to_virt(self.root_paddr) as *mut PageTable;
-        for level in 0..4 {
-            let index = (vaddr.as_u64() as usize >> (12 + (3 - level) * 9)) & 0o777;
-            let entry = unsafe { &mut (&mut *page_table)[index] };
-            let flags = entry.flags();
-            entry.set_flags(flags | PTF::USER_ACCESSIBLE);
-            if level == 3 || flags.contains(PTF::HUGE_PAGE) {
-                return;
-            }
-            page_table = frame_to_page_table(entry.frame().unwrap());
-        }
+    /// Get the physical address of root page table.
+    #[export_name = "hal_pt_table_phys"]
+    fn table_phys(&self) -> PhysAddr {
+        self.root_paddr
     }
 }
 
@@ -176,7 +195,7 @@ impl FlagsExt for MMUFlags {
                 flags |= PTF::NO_CACHE | PTF::WRITE_THROUGH;
             }
             Ok(CachePolicy::WriteCombining) => {
-                flags |= PTF::HUGE_PAGE | PTF::NO_CACHE | PTF::WRITE_THROUGH;
+                flags |= PTF::NO_CACHE | PTF::WRITE_THROUGH;
                 // 当位于level=1时，页面更大，在1<<12位上（0x100）为1
                 // 但是bitflags里面没有这一位。由页表自行管理标记位去吧
             }
@@ -217,7 +236,7 @@ struct Framebuffer {
 impl DrawTarget<Rgb888> for Framebuffer {
     type Error = core::convert::Infallible;
 
-    fn draw_pixel(&mut self, item: Pixel<Rgb888>) -> Result<(), Self::Error> {
+    fn draw_pixel(&mut self, item: Pixel<Rgb888>) -> core::result::Result<(), Self::Error> {
         let idx = (item.0.x as u32 + item.0.y as u32 * self.width) as usize;
         self.buf[idx] = unsafe { core::mem::transmute(item.1) };
         Ok(())
@@ -255,7 +274,7 @@ pub fn putfmt(fmt: Arguments) {
 
 lazy_static! {
     static ref STDIN: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
-    static ref STDIN_CALLBACK: Mutex<Vec<Box<dyn FnOnce() + Send + Sync>>> = Mutex::new(Vec::new());
+    static ref STDIN_CALLBACK: Mutex<Vec<Box<dyn Fn() -> bool + Send + Sync>>> = Mutex::new(Vec::new());
 }
 
 /// Put a char by serial interrupt handler.
@@ -264,13 +283,11 @@ fn serial_put(mut x: u8) {
         x = b'\n';
     }
     STDIN.lock().push_back(x);
-    for callback in STDIN_CALLBACK.lock().drain(..) {
-        callback();
-    }
+    STDIN_CALLBACK.lock().retain(|f| !f());
 }
 
 #[export_name = "hal_serial_set_callback"]
-pub fn serial_set_callback(callback: Box<dyn FnOnce() + Send + Sync>) {
+pub fn serial_set_callback(callback: Box<dyn Fn() -> bool + Send + Sync>) {
     STDIN_CALLBACK.lock().push(callback);
 }
 
@@ -289,8 +306,11 @@ pub fn serial_write(s: &str) {
     putfmt(format_args!("{}", s));
 }
 
+/// Get TSC frequency.
+///
+/// WARN: This will be very slow on virtual machine since it uses CPUID instruction.
 fn tsc_frequency() -> u16 {
-    const DEFAULT: u16 = 3000;
+    const DEFAULT: u16 = 2600;
     if let Some(info) = raw_cpuid::CpuId::new().get_processor_frequency_info() {
         let f = info.processor_base_frequency();
         return if f == 0 { DEFAULT } else { f };
@@ -302,7 +322,7 @@ fn tsc_frequency() -> u16 {
 #[export_name = "hal_timer_now"]
 pub fn timer_now() -> Duration {
     let tsc = unsafe { core::arch::x86_64::_rdtsc() };
-    Duration::from_nanos(tsc * 1000 / tsc_frequency() as u64)
+    Duration::from_nanos(tsc * 1000 / unsafe { TSC_FREQUENCY } as u64)
 }
 
 fn timer_init() {
@@ -310,10 +330,10 @@ fn timer_init() {
     lapic.cpu_init();
 }
 
-#[inline(always)]
-pub fn irq_enable(irq: u8) {
-    let mut ioapic = unsafe { IoApic::new(phys_to_virt(IOAPIC_ADDR)) };
-    ioapic.enable(irq, 0);
+#[export_name = "hal_apic_local_id"]
+pub fn apic_local_id() -> u8 {
+    let lapic = unsafe { XApic::new(phys_to_virt(LAPIC_ADDR)) };
+    lapic.id() as u8
 }
 
 const LAPIC_ADDR: usize = 0xfee0_0000;
@@ -321,8 +341,8 @@ const IOAPIC_ADDR: usize = 0xfec0_0000;
 
 #[export_name = "hal_vdso_constants"]
 fn vdso_constants() -> VdsoConstants {
-    let tsc_frequency = tsc_frequency();
-    VdsoConstants {
+    let tsc_frequency = unsafe { TSC_FREQUENCY };
+    let mut constants = VdsoConstants {
         max_num_cpus: 1,
         features: Features {
             cpu: 0,
@@ -335,8 +355,14 @@ fn vdso_constants() -> VdsoConstants {
         ticks_to_mono_numerator: 1000,
         ticks_to_mono_denominator: tsc_frequency as u32,
         physmem: 0,
-        buildid: Default::default(),
-    }
+        version_string_len: 0,
+        version_string: Default::default(),
+    };
+    constants.set_version_string(git_version!(
+        prefix = "git-",
+        args = ["--always", "--abbrev=40", "--dirty=-dirty"]
+    ));
+    constants
 }
 
 /// Initialize the HAL.
@@ -349,6 +375,29 @@ pub fn init(config: Config) {
         Cr4::update(|f| f.insert(Cr4Flags::PAGE_GLOBAL));
         // store config
         CONFIG = config;
+        // get tsc frequency
+        TSC_FREQUENCY = tsc_frequency();
+
+        // start multi-processors
+        fn ap_main() {
+            info!("processor {} started", apic_local_id());
+            unsafe {
+                trapframe::init();
+            }
+            timer_init();
+            let ap_fn = unsafe { CONFIG.ap_fn };
+            ap_fn()
+        }
+        fn stack_fn(pid: usize) -> usize {
+            // split and reuse the current stack
+            unsafe {
+                let mut stack: usize;
+                asm!("mov {}, rsp", out(reg) stack);
+                stack -= 0x4000 * pid;
+                stack
+            }
+        }
+        x86_smpboot::start_application_processors(ap_main, stack_fn, phys_to_virt);
     }
 }
 
@@ -356,6 +405,7 @@ pub fn init(config: Config) {
 pub struct Config {
     pub acpi_rsdp: u64,
     pub smbios: u64,
+    pub ap_fn: fn() -> !,
 }
 
 #[export_name = "fetch_fault_vaddr"]
@@ -372,4 +422,76 @@ pub fn pc_firmware_tables() -> (u64, u64) {
 static mut CONFIG: Config = Config {
     acpi_rsdp: 0,
     smbios: 0,
+    ap_fn: || unreachable!(),
 };
+
+static mut TSC_FREQUENCY: u16 = 2600;
+
+/// Build ACPI Table
+struct AcpiHelper {}
+impl AcpiHandler for AcpiHelper {
+    unsafe fn map_physical_region<T>(
+        &mut self,
+        physical_address: usize,
+        size: usize,
+    ) -> PhysicalMapping<T> {
+        #[allow(non_snake_case)]
+        let OFFSET = 0;
+        let page_start = physical_address / PAGE_SIZE;
+        let page_end = (physical_address + size + PAGE_SIZE - 1) / PAGE_SIZE;
+        PhysicalMapping::<T> {
+            physical_start: physical_address,
+            virtual_start: NonNull::new_unchecked(phys_to_virt(physical_address + OFFSET) as *mut T),
+            mapped_length: size,
+            region_length: PAGE_SIZE * (page_end - page_start),
+        }
+    }
+    fn unmap_physical_region<T>(&mut self, _region: PhysicalMapping<T>) {}
+}
+
+#[export_name = "hal_acpi_table"]
+pub fn get_acpi_table() -> Option<Acpi> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut handler = AcpiHelper {};
+        match unsafe { parse_rsdp(&mut handler, pc_firmware_tables().0 as usize) } {
+            Ok(table) => Some(table),
+            Err(info) => {
+                warn!("get_acpi_table error: {:#x?}", info);
+                None
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    None
+}
+
+/// IO Port in/out instruction
+#[export_name = "hal_outpd"]
+pub fn outpd(port: u16, value: u32) {
+    unsafe {
+        Port::new(port).write(value);
+    }
+}
+
+#[export_name = "hal_inpd"]
+pub fn inpd(port: u16) -> u32 {
+    unsafe { Port::new(port).read() }
+}
+
+/// Flush the physical frame.
+#[export_name = "hal_frame_flush"]
+pub fn frame_flush(target: PhysAddr) {
+    unsafe {
+        for paddr in (target..target + PAGE_SIZE).step_by(cacheline_size()) {
+            _mm_clflush(phys_to_virt(paddr) as *const u8);
+        }
+        _mm_mfence();
+    }
+}
+
+/// Get cache line size in bytes.
+fn cacheline_size() -> usize {
+    let leaf = unsafe { __cpuid(1).ebx };
+    (((leaf >> 8) & 0xff) << 3) as usize
+}

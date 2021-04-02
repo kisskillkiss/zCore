@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use {super::*, bitflags::bitflags};
 
 bitflags! {
@@ -18,8 +19,13 @@ bitflags! {
 
         const SOCKET_PEER_WRITE_DISABLED    = 1 << 4;
         const SOCKET_WRITE_DISABLED         = 1 << 5;
+        const SOCKET_CONTROL_READABLE       = 1 << 6;
+        const SOCKET_CONTROL_WRITABLE       = 1 << 7;
+        const SCOEKT_ACCEPT                 = 1 << 8;
+        const SOCKET_SHARE                  = 1 << 9;
         const SOCKET_READ_THRESHOLD         = 1 << 10;
         const SOCKET_WRITE_THRESHOLD        = 1 << 11;
+
 
         const TASK_TERMINATED               = Self::SIGNALED.bits;
 
@@ -34,6 +40,8 @@ bitflags! {
         const THREAD_SUSPENDED              = 1 << 5;
 
         const VMO_ZERO_CHILDREN             = Self::SIGNALED.bits;
+
+        const INTERRUPT_SIGNAL              = 1 << 4;
 
         // for Linux
         const SIGCHLD                       = 1 << 6;
@@ -51,11 +59,30 @@ bitflags! {
 }
 
 impl Signal {
+    /// Verify whether `number` only sets the bits specified in `allowed_signals`.
     pub fn verify_user_signal(allowed_signals: Signal, number: u32) -> ZxResult<Signal> {
         if (number & !allowed_signals.bits()) != 0 {
             Err(ZxError::INVALID_ARGS)
         } else {
             Ok(Signal::from_bits(number).ok_or(ZxError::INVALID_ARGS)?)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verify_user_signal() {
+        assert_eq!(
+            Err(ZxError::INVALID_ARGS),
+            Signal::verify_user_signal(Signal::USER_ALL, 1 << 0)
+        );
+
+        assert_eq!(
+            Ok(Signal::USER_SIGNAL_0),
+            Signal::verify_user_signal(Signal::USER_ALL, 1 << 24)
+        );
     }
 }

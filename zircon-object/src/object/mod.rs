@@ -120,23 +120,53 @@ mod signal;
 ///
 /// [`impl_kobject`]: impl_kobject
 pub trait KernelObject: DowncastSync + Debug {
+    /// Get object's KoID.
     fn id(&self) -> KoID;
+    /// Get the name of the type of the kernel object.
     fn type_name(&self) -> &str;
+    /// Get object's name.
     fn name(&self) -> alloc::string::String;
+    /// Set object's name.
     fn set_name(&self, name: &str);
+    /// Get the signal status.
     fn signal(&self) -> Signal;
+    /// Assert `signal`.
     fn signal_set(&self, signal: Signal);
+    /// Deassert `signal`.
+    fn signal_clear(&self, signal: Signal);
+    /// Change signal status: first `clear` then `set` indicated bits.
+    ///
+    /// All signal callbacks will be called.
     fn signal_change(&self, clear: Signal, set: Signal);
+    /// Add `callback` for signal status changes.
+    ///
+    /// The `callback` is a function of `Fn(Signal) -> bool`.
+    /// It returns a bool indicating whether the handle process is over.
+    /// If true, the function will never be called again.
     fn add_signal_callback(&self, callback: SignalHandler);
+    /// Attempt to find a child of the object with given KoID.
+    ///
+    /// If the object is a *Process*, the *Threads* it contains may be obtained.
+    ///
+    /// If the object is a *Job*, its (immediate) child *Jobs* and the *Processes*
+    /// it contains may be obtained.
+    ///
+    /// If the object is a *Resource*, its (immediate) child *Resources* may be obtained.
     fn get_child(&self, _id: KoID) -> ZxResult<Arc<dyn KernelObject>> {
         Err(ZxError::WRONG_TYPE)
     }
+    /// Attempt to get the object's peer.
+    ///
+    /// An object peer is the opposite endpoint of a `Channel`, `Socket`, `Fifo`, or `EventPair`.
     fn peer(&self) -> ZxResult<Arc<dyn KernelObject>> {
         Err(ZxError::NOT_SUPPORTED)
     }
+    /// If the object is related to another (such as the other end of a channel, or the parent of
+    /// a job), returns the KoID of that object, otherwise returns zero.
     fn related_koid(&self) -> KoID {
         0
     }
+    /// Get object's allowed signals.
     fn allowed_signals(&self) -> Signal {
         Signal::USER_ALL
     }
@@ -146,6 +176,7 @@ impl_downcast!(sync KernelObject);
 
 /// The base struct of a kernel object.
 pub struct KObjectBase {
+    /// The object's KoID.
     pub id: KoID,
     inner: Mutex<KObjectBaseInner>,
 }
@@ -175,24 +206,12 @@ impl KObjectBase {
 
     /// Create a kernel object base with initial `signal`.
     pub fn with_signal(signal: Signal) -> Self {
-        KObjectBase {
-            id: Self::new_koid(),
-            inner: Mutex::new(KObjectBaseInner {
-                signal,
-                ..Default::default()
-            }),
-        }
+        KObjectBase::with(Default::default(), signal)
     }
 
     /// Create a kernel object base with `name`.
     pub fn with_name(name: &str) -> Self {
-        KObjectBase {
-            id: Self::new_koid(),
-            inner: Mutex::new(KObjectBaseInner {
-                name: String::from(name),
-                ..Default::default()
-            }),
-        }
+        KObjectBase::with(name, Default::default())
     }
 
     /// Create a kernel object base with both signal and name
@@ -260,7 +279,12 @@ impl KObjectBase {
     /// If true, the function will never be called again.
     pub fn add_signal_callback(&self, callback: SignalHandler) {
         let mut inner = self.inner.lock();
-        inner.signal_callbacks.push(callback);
+        // Check the callback immediately, in case that a signal arrives just before the call of
+        // `add_signal_callback` (since lock is acquired inside it) and the callback is not triggered
+        // in time.
+        if !callback(inner.signal) {
+            inner.signal_callbacks.push(callback);
+        }
     }
 }
 
@@ -322,6 +346,7 @@ impl dyn KernelObject {
                     observed: current_signal,
                     count: 1,
                     timestamp: 0,
+                    _reserved1: 0,
                 }),
             });
             return;
@@ -340,6 +365,7 @@ impl dyn KernelObject {
                         observed: s,
                         count: 1,
                         timestamp: 0,
+                        _reserved1: 0,
                     }),
                 });
                 true
@@ -425,6 +451,9 @@ macro_rules! impl_kobject {
             fn signal_set(&self, signal: Signal) {
                 self.base.signal_set(signal);
             }
+            fn signal_clear(&self, signal: Signal) {
+                self.base.signal_clear(signal);
+            }
             fn signal_change(&self, clear: Signal, set: Signal) {
                 self.base.signal_change(clear, set);
             }
@@ -483,6 +512,7 @@ pub struct DummyObject {
 impl_kobject!(DummyObject);
 
 impl DummyObject {
+    /// Create a new `DummyObject`.
     pub fn new() -> Arc<Self> {
         Arc::new(DummyObject {
             base: KObjectBase::new(),
@@ -493,57 +523,56 @@ impl DummyObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_std::sync::Barrier;
     use std::time::Duration;
 
     #[async_std::test]
     async fn wait() {
         let object = DummyObject::new();
-        let flag = Arc::new(AtomicU8::new(0));
-
+        let barrier = Arc::new(Barrier::new(2));
         async_std::task::spawn({
             let object = object.clone();
-            let flag = flag.clone();
+            let barrier = barrier.clone();
             async move {
-                flag.store(1, Ordering::SeqCst);
-                object.base.signal_set(Signal::READABLE);
-                async_std::task::sleep(Duration::from_millis(10)).await;
+                async_std::task::sleep(Duration::from_millis(20)).await;
 
-                flag.store(2, Ordering::SeqCst);
-                object.base.signal_set(Signal::WRITABLE);
+                // Assert an irrelevant signal to test the `false` branch of the callback for `READABLE`.
+                object.signal_set(Signal::USER_SIGNAL_0);
+                object.signal_clear(Signal::USER_SIGNAL_0);
+                object.signal_set(Signal::READABLE);
+                barrier.wait().await;
+
+                object.signal_set(Signal::WRITABLE);
             }
         });
         let object: Arc<dyn KernelObject> = object;
-        assert_eq!(flag.load(Ordering::SeqCst), 0);
 
         let signal = object.wait_signal(Signal::READABLE).await;
         assert_eq!(signal, Signal::READABLE);
-        assert_eq!(flag.load(Ordering::SeqCst), 1);
+        barrier.wait().await;
 
         let signal = object.wait_signal(Signal::WRITABLE).await;
         assert_eq!(signal, Signal::READABLE | Signal::WRITABLE);
-        assert_eq!(flag.load(Ordering::SeqCst), 2);
     }
 
     #[async_std::test]
     async fn wait_many() {
         let objs = [DummyObject::new(), DummyObject::new()];
-        let flag = Arc::new(AtomicU8::new(0));
-
+        let barrier = Arc::new(Barrier::new(2));
         async_std::task::spawn({
             let objs = objs.clone();
-            let flag = flag.clone();
+            let barrier = barrier.clone();
             async move {
-                flag.store(1, Ordering::SeqCst);
-                objs[0].base.signal_set(Signal::READABLE);
-                async_std::task::sleep(Duration::from_millis(10)).await;
+                async_std::task::sleep(Duration::from_millis(20)).await;
 
-                flag.store(2, Ordering::SeqCst);
-                objs[1].base.signal_set(Signal::WRITABLE);
+                objs[0].signal_set(Signal::READABLE);
+                barrier.wait().await;
+
+                objs[1].signal_set(Signal::WRITABLE);
             }
         });
         let obj0: Arc<dyn KernelObject> = objs[0].clone();
         let obj1: Arc<dyn KernelObject> = objs[1].clone();
-        assert_eq!(flag.load(Ordering::SeqCst), 0);
 
         let signals = wait_signal_many(&[
             (obj0.clone(), Signal::READABLE),
@@ -551,7 +580,7 @@ mod tests {
         ])
         .await;
         assert_eq!(signals, [Signal::READABLE, Signal::empty()]);
-        assert_eq!(flag.load(Ordering::SeqCst), 1);
+        barrier.wait().await;
 
         let signals = wait_signal_many(&[
             (obj0.clone(), Signal::WRITABLE),
@@ -559,6 +588,27 @@ mod tests {
         ])
         .await;
         assert_eq!(signals, [Signal::READABLE, Signal::WRITABLE]);
-        assert_eq!(flag.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_trait_with_dummy() {
+        let dummy = DummyObject::new();
+        assert_eq!(dummy.name(), String::from(""));
+        dummy.set_name("test");
+        assert_eq!(dummy.name(), String::from("test"));
+        dummy.signal_set(Signal::WRITABLE);
+        assert_eq!(dummy.signal(), Signal::WRITABLE);
+        dummy.signal_change(Signal::WRITABLE, Signal::READABLE);
+        assert_eq!(dummy.signal(), Signal::READABLE);
+
+        assert_eq!(dummy.get_child(0).unwrap_err(), ZxError::WRONG_TYPE);
+        assert_eq!(dummy.peer().unwrap_err(), ZxError::NOT_SUPPORTED);
+        assert_eq!(dummy.related_koid(), 0);
+        assert_eq!(dummy.allowed_signals(), Signal::USER_ALL);
+
+        assert_eq!(
+            format!("{:?}", dummy),
+            format!("DummyObject({}, \"test\")", dummy.id())
+        );
     }
 }

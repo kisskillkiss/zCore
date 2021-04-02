@@ -1,6 +1,7 @@
 //! Objects for Task Management.
 
-use {super::*, crate::ipc::Channel, crate::signal::Port};
+use super::*;
+use alloc::sync::Arc;
 
 mod exception;
 mod job;
@@ -10,20 +11,28 @@ mod suspend_token;
 mod thread;
 
 pub use {
-    self::job::*, self::job_policy::*, self::process::*, self::suspend_token::*, self::thread::*,
+    self::exception::*, self::job::*, self::job_policy::*, self::process::*,
+    self::suspend_token::*, self::thread::*,
 };
 
 /// Task (Thread, Process, or Job)
-pub trait Task {
-    /// Kill the task.
-    fn kill(&mut self) -> ZxResult;
+pub trait Task: Sync + Send {
+    /// Kill the task. The task do not terminate immediately when killed.
+    /// It will terminate after all its children are terminated or some cleanups are finished.
+    fn kill(&self);
 
     /// Suspend the task. Currently only thread or process handles may be suspended.
-    fn suspend(&mut self) -> ZxResult;
+    fn suspend(&self);
 
-    /// Create an exception channel on the task.
-    fn create_exception_channel(&mut self, options: u32) -> ZxResult<Channel>;
+    /// Resume the task
+    fn resume(&self);
 
-    /// Resume the task from a previously caught exception.
-    fn resume_from_exception(&mut self, port: &Port, options: u32) -> ZxResult;
+    /// Get the exceptionate.
+    fn exceptionate(&self) -> Arc<Exceptionate>;
+
+    /// Get the debug exceptionate.
+    fn debug_exceptionate(&self) -> Arc<Exceptionate>;
 }
+
+/// The return code set when a task is killed via zx_task_kill().
+pub const TASK_RETCODE_SYSCALL_KILL: i64 = -1028;

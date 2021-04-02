@@ -1,4 +1,4 @@
-#![feature(asm, global_asm)]
+#![feature(asm)]
 #![feature(linkage)]
 #![deny(warnings)]
 
@@ -11,6 +11,8 @@ use {
     alloc::collections::VecDeque,
     async_std::task_local,
     core::{cell::Cell, future::Future, pin::Pin},
+    git_version::git_version,
+    kernel_hal::PageTableTrait,
     lazy_static::lazy_static,
     std::fmt::{Debug, Formatter},
     std::fs::{File, OpenOptions},
@@ -21,16 +23,14 @@ use {
     tempfile::tempdir,
 };
 
-pub use self::trap::syscall_entry;
 pub use kernel_hal::defs::*;
 use kernel_hal::vdso::*;
 pub use kernel_hal::*;
 use std::io::Read;
+pub use trapframe::syscall_fn_entry as syscall_entry;
 
 #[cfg(target_os = "macos")]
 include!("macos.rs");
-
-mod trap;
 
 #[repr(C)]
 pub struct Thread {
@@ -66,11 +66,7 @@ task_local! {
 
 #[export_name = "hal_context_run"]
 unsafe fn context_run(context: &mut UserContext) {
-    core::arch::x86_64::_fxrstor64(&context.vector as *const VectorRegs as _);
-    trap::run_user(&mut context.general);
-    core::arch::x86_64::_fxsave64(&mut context.vector as *mut VectorRegs as _);
-    // cause: syscall
-    context.trap_num = 0x100;
+    context.run_fncall();
 }
 
 /// Page Table
@@ -86,10 +82,12 @@ impl PageTable {
     pub fn new() -> Self {
         PageTable { table_phys: 0 }
     }
+}
 
+impl PageTableTrait for PageTable {
     /// Map the page of `vaddr` to the frame of `paddr` with `flags`.
     #[export_name = "hal_pt_map"]
-    pub fn map(&mut self, vaddr: VirtAddr, paddr: PhysAddr, flags: MMUFlags) -> Result<(), ()> {
+    fn map(&mut self, vaddr: VirtAddr, paddr: PhysAddr, flags: MMUFlags) -> Result<()> {
         debug_assert!(page_aligned(vaddr));
         debug_assert!(page_aligned(paddr));
         let prot = flags.to_mmap_prot();
@@ -99,13 +97,13 @@ impl PageTable {
 
     /// Unmap the page of `vaddr`.
     #[export_name = "hal_pt_unmap"]
-    pub fn unmap(&mut self, vaddr: VirtAddr) -> Result<(), ()> {
+    fn unmap(&mut self, vaddr: VirtAddr) -> Result<()> {
         self.unmap_cont(vaddr, 1)
     }
 
     /// Change the `flags` of the page of `vaddr`.
     #[export_name = "hal_pt_protect"]
-    pub fn protect(&mut self, vaddr: VirtAddr, flags: MMUFlags) -> Result<(), ()> {
+    fn protect(&mut self, vaddr: VirtAddr, flags: MMUFlags) -> Result<()> {
         debug_assert!(page_aligned(vaddr));
         let prot = flags.to_mmap_prot();
         let ret = unsafe { libc::mprotect(vaddr as _, PAGE_SIZE, prot) };
@@ -115,13 +113,19 @@ impl PageTable {
 
     /// Query the physical address which the page of `vaddr` maps to.
     #[export_name = "hal_pt_query"]
-    pub fn query(&mut self, vaddr: VirtAddr) -> Result<PhysAddr, ()> {
+    fn query(&mut self, vaddr: VirtAddr) -> Result<PhysAddr> {
         debug_assert!(page_aligned(vaddr));
         unimplemented!()
     }
 
+    /// Get the physical address of root page table.
+    #[export_name = "hal_pt_table_phys"]
+    fn table_phys(&self) -> PhysAddr {
+        self.table_phys
+    }
+
     #[export_name = "hal_pt_unmap_cont"]
-    pub fn unmap_cont(&mut self, vaddr: VirtAddr, pages: usize) -> Result<(), ()> {
+    fn unmap_cont(&mut self, vaddr: VirtAddr, pages: usize) -> Result<()> {
         if pages == 0 {
             return Ok(());
         }
@@ -138,7 +142,7 @@ pub struct PhysFrame {
 }
 
 impl Debug for PhysFrame {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::result::Result<(), std::fmt::Error> {
         write!(f, "PhysFrame({:#x})", self.paddr)
     }
 }
@@ -150,7 +154,7 @@ lazy_static! {
 
 impl PhysFrame {
     #[export_name = "hal_frame_alloc"]
-    pub extern "C" fn alloc() -> Option<Self> {
+    pub fn alloc() -> Option<Self> {
         let ret = AVAILABLE_FRAMES
             .lock()
             .unwrap()
@@ -175,7 +179,7 @@ impl Drop for PhysFrame {
 
 fn phys_to_virt(paddr: PhysAddr) -> VirtAddr {
     /// Map physical memory from here.
-    const PMEM_BASE: VirtAddr = 0x8_00000000;
+    const PMEM_BASE: VirtAddr = 0x8_0000_0000;
 
     PMEM_BASE + paddr
 }
@@ -243,7 +247,7 @@ fn page_aligned(x: VirtAddr) -> bool {
     x % PAGE_SIZE == 0
 }
 
-const PMEM_SIZE: usize = 0x400_00000; // 1GiB
+const PMEM_SIZE: usize = 0x4000_0000; // 1GiB
 
 lazy_static! {
     static ref FRAME_FILE: File = create_pmem_file();
@@ -298,11 +302,11 @@ fn mmap(fd: libc::c_int, offset: usize, len: usize, vaddr: VirtAddr, prot: libc:
 }
 
 trait FlagsExt {
-    fn to_mmap_prot(self) -> libc::c_int;
+    fn to_mmap_prot(&self) -> libc::c_int;
 }
 
 impl FlagsExt for MMUFlags {
-    fn to_mmap_prot(self) -> libc::c_int {
+    fn to_mmap_prot(&self) -> libc::c_int {
         let mut flags = 0;
         if self.contains(MMUFlags::READ) {
             flags |= libc::PROT_READ;
@@ -319,19 +323,18 @@ impl FlagsExt for MMUFlags {
 
 lazy_static! {
     static ref STDIN: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
-    static ref STDIN_CALLBACK: Mutex<Vec<Box<dyn FnOnce() + Send + Sync>>> = Mutex::new(Vec::new());
+    static ref STDIN_CALLBACK: Mutex<Vec<Box<dyn Fn() -> bool + Send + Sync>>> =
+        Mutex::new(Vec::new());
 }
 
 /// Put a char by serial interrupt handler.
 fn serial_put(x: u8) {
     STDIN.lock().unwrap().push_back(x);
-    for callback in STDIN_CALLBACK.lock().unwrap().drain(..) {
-        callback();
-    }
+    STDIN_CALLBACK.lock().unwrap().retain(|f| !f());
 }
 
 #[export_name = "hal_serial_set_callback"]
-pub fn serial_set_callback(callback: Box<dyn FnOnce() + Send + Sync>) {
+pub fn serial_set_callback(callback: Box<dyn Fn() -> bool + Send + Sync>) {
     STDIN_CALLBACK.lock().unwrap().push(callback);
 }
 
@@ -376,7 +379,7 @@ pub fn timer_set(deadline: Duration, callback: Box<dyn FnOnce(Duration) + Send +
 #[export_name = "hal_vdso_constants"]
 pub fn vdso_constants() -> VdsoConstants {
     let tsc_frequency = 3000u16;
-    VdsoConstants {
+    let mut constants = VdsoConstants {
         max_num_cpus: 1,
         features: Features {
             cpu: 0,
@@ -389,8 +392,14 @@ pub fn vdso_constants() -> VdsoConstants {
         ticks_to_mono_numerator: 1000,
         ticks_to_mono_denominator: tsc_frequency as u32,
         physmem: PMEM_SIZE as u64,
-        buildid: Default::default(),
-    }
+        version_string_len: 0,
+        version_string: Default::default(),
+    };
+    constants.set_version_string(git_version!(
+        prefix = "git-",
+        args = ["--always", "--abbrev=40", "--dirty=-dirty"]
+    ));
+    constants
 }
 
 /// Initialize the HAL.

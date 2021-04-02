@@ -8,9 +8,11 @@ pub type ZxResult<T = ()> = Result<T, ZxError>;
 /// - Positive values are reserved for protocol-specific error values,
 ///   and will never be defined by the system.
 #[allow(non_camel_case_types)]
+#[allow(clippy::upper_case_acronyms)]
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ZxError {
+    /// Success.
     OK = 0,
 
     // ======= Internal failures =======
@@ -234,6 +236,9 @@ impl From<Error> for ZxError {
         match e {
             Error::InvalidUtf8 => ZxError::INVALID_ARGS,
             Error::InvalidPointer => ZxError::INVALID_ARGS,
+            Error::BufferTooSmall => ZxError::BUFFER_TOO_SMALL,
+            Error::InvalidLength => ZxError::INVALID_ARGS,
+            Error::InvalidVectorAddress => ZxError::NOT_FOUND,
         }
     }
 }

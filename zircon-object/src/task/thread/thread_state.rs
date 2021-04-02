@@ -4,6 +4,8 @@ use numeric_enum_macro::numeric_enum;
 
 numeric_enum! {
     #[repr(u32)]
+    /// Possible values for "kind" in zx_thread_read_state and zx_thread_write_state.
+    #[allow(missing_docs)]
     #[derive(Debug, Copy, Clone)]
     pub enum ThreadStateKind {
         General = 0,
@@ -11,14 +13,12 @@ numeric_enum! {
         Vector = 2,
         Debug = 4,
         SingleStep = 5,
-        #[cfg(target_arch = "x86_64")]
         FS = 6,
-        #[cfg(target_arch = "x86_64")]
         GS = 7,
     }
 }
 
-pub trait ContextExt {
+pub(super) trait ContextExt {
     fn read_state(&self, kind: ThreadStateKind, buf: &mut [u8]) -> ZxResult<usize>;
     fn write_state(&mut self, kind: ThreadStateKind, buf: &[u8]) -> ZxResult;
 }
@@ -31,7 +31,7 @@ impl ContextExt for UserContext {
             ThreadStateKind::FS => buf.write_struct(&self.general.fsbase),
             #[cfg(target_arch = "x86_64")]
             ThreadStateKind::GS => buf.write_struct(&self.general.gsbase),
-            _ => unimplemented!(),
+            _ => Err(ZxError::NOT_SUPPORTED),
         }
     }
 
@@ -42,7 +42,7 @@ impl ContextExt for UserContext {
             ThreadStateKind::FS => self.general.fsbase = buf.read_struct()?,
             #[cfg(target_arch = "x86_64")]
             ThreadStateKind::GS => self.general.gsbase = buf.read_struct()?,
-            _ => unimplemented!(),
+            _ => return Err(ZxError::NOT_SUPPORTED),
         }
         Ok(())
     }
